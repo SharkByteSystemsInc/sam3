@@ -28,20 +28,13 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-# SAM3 imports
-from sam3.model_builder import build_sam3_image_model
-from sam3.model.sam3_image_processor import Sam3Processor
-
 # For JSON manipulation
 import json
 
-
-class ModelResult:
-    """Simple container for model inference results"""
-    def __init__(self, class_name: str, confidence: float, mask: np.ndarray):
-        self.class_name = class_name
-        self.confidence = confidence
-        self.mask = mask
+# Import inference modules and utilities
+from utils import ModelResult
+from model_inference import SAM3Annotator, run_standard_inference
+from agent_inference import run_agent_inference
 
 
 def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -292,76 +285,6 @@ def detect_passengers(
     return passenger_results
 
 
-class SAM3Annotator:
-    """Wrapper for SAM3 model inference"""
-
-    def __init__(self, device: str = "cuda", logger: logging.Logger = None):
-        """
-        Initialize SAM3 model
-
-        Args:
-            device: Device to run on ('cuda' or 'cpu')
-            logger: Logger instance
-        """
-        self.device = device
-        self.logger = logger or logging.getLogger(__name__)
-
-        self.logger.info("Loading SAM3 model...")
-        self.model = build_sam3_image_model(
-            device=device,
-            eval_mode=True,
-            enable_inst_interactivity=False,
-            compile=False
-        )
-        self.processor = Sam3Processor(self.model, resolution=1008)
-        self.logger.info("SAM3 model loaded successfully")
-
-    def segment_image(self, image: np.ndarray, text_prompt: str) -> Tuple[List[np.ndarray], List[float]]:
-        """
-        Run SAM3 inference on an image with a text prompt
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            text_prompt: Text prompt for segmentation (e.g., "car")
-
-        Returns:
-            Tuple of (masks, scores) where masks are boolean numpy arrays and scores are confidence values
-        """
-        # Convert numpy array to PIL Image if needed
-        if isinstance(image, np.ndarray):
-            pil_image = Image.fromarray(image)
-        else:
-            pil_image = image
-
-        # Run SAM3 inference
-        state = self.processor.set_image(pil_image)
-        output = self.processor.set_text_prompt(text_prompt, state)
-
-        # Extract masks and scores
-        masks = output.get("masks", [])
-        scores = output.get("scores", [])
-
-        # Filter masks by confidence threshold
-        confidence_threshold = 0.4
-        filtered_masks = []
-        filtered_scores = []
-
-        if len(masks) > 0:
-            for mask, score in zip(masks, scores):
-                if score >= confidence_threshold:
-                    # Convert mask to boolean numpy array
-                    if isinstance(mask, torch.Tensor):
-                        mask = mask.cpu().numpy()
-
-                    # Ensure mask is 2D and boolean
-                    if len(mask.shape) == 3:
-                        mask = mask[0]  # Take first channel if 3D
-
-                    mask = mask.astype(bool)
-                    filtered_masks.append(mask)
-                    filtered_scores.append(float(score))
-
-        return filtered_masks, filtered_scores
 
 
 def load_metadata(metadata_path: str) -> dict:
@@ -383,6 +306,9 @@ def process_image(
     out_top_dir: str,
     input_top_dir: str,
     override_previous: bool,
+    use_agent: bool,
+    llm_server_url: str,
+    llm_model: str,
     logger: logging.Logger
 ) -> bool:
     """
@@ -394,6 +320,9 @@ def process_image(
         out_top_dir: Output top directory
         input_top_dir: Input top directory (for computing relative paths)
         override_previous: Whether to override existing annotations
+        use_agent: Whether to use SAM3 agent mode
+        llm_server_url: URL of the LLM server (for agent mode)
+        llm_model: Model name/identifier (for agent mode)
         logger: Logger instance
 
     Returns:
@@ -443,42 +372,36 @@ def process_image(
 
     # Run SAM3 inference for each class
     classes_to_segment = ["car", "license plate", "person"]
-    all_results = []
-    car_results = []
-    person_results = []
 
-    for class_name in classes_to_segment:
-        logger.debug(f"Segmenting {class_name} in {img_path.name}")
+    if use_agent:
+        # Use agent-based inference
+        logger.debug(f"Running agent inference for {img_path.name}")
         try:
-            masks, scores = sam3_annotator.segment_image(image, class_name)
-
-            # Add results
-            for mask, score in zip(masks, scores):
-                # Resize mask to original image size if needed
-                if mask.shape != (height, width):
-                    mask = cv2.resize(
-                        mask.astype(np.uint8) * 255,
-                        (width, height),
-                        interpolation=cv2.INTER_NEAREST
-                    ) > 127
-
-                result = ModelResult(
-                    class_name=class_name.replace(" ", "_"),  # "license plate" -> "license_plate"
-                    confidence=score,  # Use actual SAM3 confidence score
-                    mask=mask
-                )
-                all_results.append(result)
-                logger.debug(f"  Detected {class_name} with confidence {score:.3f}")
-
-                # Keep track of cars and persons separately for passenger detection
-                if class_name == "car":
-                    car_results.append(result)
-                elif class_name == "person":
-                    person_results.append(result)
-
+            all_results, car_results, person_results = run_agent_inference(
+                image_path=str(img_path),
+                classes_to_segment=classes_to_segment,
+                sam3_annotator=sam3_annotator,
+                llm_server_url=llm_server_url,
+                llm_model=llm_model,
+                output_dir=os.path.dirname(output_metadata_path),
+                logger=logger
+            )
         except Exception as e:
-            logger.error(f"Error during SAM3 inference for {class_name}: {e}")
-            continue
+            logger.error(f"Error during agent inference: {e}")
+            return False
+    else:
+        # Use standard inference
+        logger.debug(f"Running standard inference for {img_path.name}")
+        try:
+            all_results, car_results, person_results = run_standard_inference(
+                image=image,
+                classes_to_segment=classes_to_segment,
+                sam3_annotator=sam3_annotator,
+                logger=logger
+            )
+        except Exception as e:
+            logger.error(f"Error during standard inference: {e}")
+            return False
 
     # Detect passengers: persons inside cars
     passenger_results = detect_passengers(person_results, car_results, logger)
@@ -628,6 +551,25 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--agent",
+        action="store_true",
+        default=False,
+        help="Use SAM3 agent mode with MLLM for iterative refinement"
+    )
+
+    parser.add_argument(
+        "--llm_server_url",
+        default="http://0.0.0.0:8001/v1",
+        help="URL of the LLM server for agent mode (default: http://0.0.0.0:8001/v1)"
+    )
+
+    parser.add_argument(
+        "--llm_model",
+        default="Qwen/Qwen3-VL-8B-Thinking",
+        help="LLM model name/identifier for agent mode (default: Qwen/Qwen3-VL-8B-Thinking)"
+    )
+
+    parser.add_argument(
         "--log_level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -659,6 +601,10 @@ def main():
     logger.info(f"Input directory: {args.input_top_dir}")
     logger.info(f"Output directory: {args.out_top_dir}")
     logger.info(f"Device: {args.device}")
+    logger.info(f"Agent mode: {args.agent}")
+    if args.agent:
+        logger.info(f"LLM server URL: {args.llm_server_url}")
+        logger.info(f"LLM model: {args.llm_model}")
 
     # Initialize SAM3 annotator
     sam3_annotator = SAM3Annotator(device=args.device, logger=logger)
@@ -696,6 +642,9 @@ def main():
                 out_top_dir=args.out_top_dir,
                 input_top_dir=args.input_top_dir,
                 override_previous=args.override_previous_annotations,
+                use_agent=args.agent,
+                llm_server_url=args.llm_server_url,
+                llm_model=args.llm_model,
                 logger=logger
             )
 
